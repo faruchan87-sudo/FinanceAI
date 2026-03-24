@@ -100,3 +100,1629 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+"""
+FinanceAI — Demo Runner
+Exercises the full pipeline using mock invoice data (no real PDFs required).
+Run:  python demo.py
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import uuid
+from datetime import date
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+import config
+from reconciler.ledger import Reconciler, save_ledger
+from tests.sample_data import MOCK_INVOICES, generate_sample_data
+from utils.logger import get_logger
+from utils.models import Invoice, LineItem
+
+logger = get_logger("demo")
+
+
+# ── Build Invoice objects from mock dicts (bypasses PDF parsing) ──────────────
+
+def _load_mock_invoices() -> list[Invoice]:
+    invoices = []
+    for d in MOCK_INVOICES:
+        line_items = [
+            LineItem(
+                description=li["description"],
+                quantity   =float(li["quantity"]),
+                unit_price =float(li["unit_price"]),
+                total      =float(li["total"]),
+            )
+            for li in d.get("line_items", [])
+        ]
+        inv = Invoice(
+            vendor         = d["vendor"],
+            invoice_number = d["invoice_number"],
+            invoice_date   = date.fromisoformat(d["invoice_date"]) if d.get("invoice_date") else None,
+            due_date       = date.fromisoformat(d["due_date"])     if d.get("due_date")     else None,
+            line_items     = line_items,
+            subtotal       = float(d["subtotal"]),
+            tax            = float(d["tax"]),
+            total          = float(d["total"]),
+            currency       = d.get("currency", "USD"),
+            source_file    = d.get("source_file", ""),
+            uid            = d.get("uid", str(uuid.uuid4())),
+        )
+        invoices.append(inv)
+    return invoices
+
+
+def main() -> None:
+    logger.info("Generating sample data …")
+    generate_sample_data()
+
+    from parsers.csv_parser import parse_expense_sheet, parse_payment_log
+    payments = parse_payment_log(config.DATA_DIR / "sample_payments.csv")
+    expenses = parse_expense_sheet(config.DATA_DIR / "sample_expenses.csv")
+    invoices = _load_mock_invoices()
+
+    logger.info(
+        "Loaded %d invoices, %d payments, %d expenses.",
+        len(invoices), len(payments), len(expenses),
+    )
+
+    reconciler = Reconciler(invoices, payments, expenses)
+    ledger     = reconciler.reconcile()
+
+    out_path = config.REPORT_DIR / "demo_ledger.json"
+    save_ledger(ledger, out_path)
+
+    # ── Pretty-print summary ──────────────────────────────────────────────────
+    print("\n" + "═" * 64)
+    print("  FINANCEAI DEMO — RECONCILED LEDGER SUMMARY")
+    print("═" * 64)
+    for entry in ledger:
+        flag_str = ", ".join(f.value for f in entry.flags)
+        print(
+            f"  {entry.vendor:<22} {entry.invoice_number:<18} "
+            f"${entry.amount:>10.2f}  {entry.payment_status.value:<10}  [{flag_str}]"
+        )
+    print("═" * 64)
+
+    from utils.models import FlagReason
+    flagged = [e for e in ledger if FlagReason.NONE not in e.flags]
+    if flagged:
+        print(f"\n  ⚠  {len(flagged)} entries require attention:")
+        for e in flagged:
+            for note in e.flag_notes:
+                print(f"     • [{e.invoice_number}] {note}")
+
+    print(f"\n  Full ledger saved to: {out_path}\n")
+
+
+if __name__ == "__main__":
+    main()
+              """
+FinanceAI — Configuration
+Central configuration for all modules.
+"""
+
+import os
+from pathlib import Path
+
+# ── Directories ──────────────────────────────────────────────────────────────
+BASE_DIR        = Path(__file__).parent
+DATA_DIR        = BASE_DIR / "data"
+INVOICE_DIR     = DATA_DIR / "invoices"
+LOG_DIR         = DATA_DIR / "logs"
+REPORT_DIR      = DATA_DIR / "reports"
+
+for _d in (INVOICE_DIR, LOG_DIR, REPORT_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+# ── API ───────────────────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL      = "claude-sonnet-4-20250514"
+MAX_TOKENS        = 2048
+
+# ── Validation thresholds ─────────────────────────────────────────────────────
+# Tolerance for floating-point sum verification (e.g. 0.02 = 2 cents)
+AMOUNT_TOLERANCE   = 0.02
+# Minimum amount to consider a line-item suspicious if it appears alone
+MIN_INVOICE_AMOUNT = 0.01
+# Maximum single-invoice amount before an "unusually large" flag fires
+MAX_INVOICE_AMOUNT = 100_000.00
+
+# ── Duplicate detection ───────────────────────────────────────────────────────
+# Two invoices are duplicates if same vendor + same amount within this many days
+DUPLICATE_WINDOW_DAYS = 30
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+LOG_LEVEL  = "DEBUG"
+LOG_FILE   = LOG_DIR / "financeai.log"
+
+# ── Output ────────────────────────────────────────────────────────────────────
+LEDGER_OUTPUT_FILE = REPORT_DIR / "reconciled_ledger.json"
+              """
+FinanceAI — Core Agent
+Orchestrates the full invoice → validate → reconcile → report pipeline.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import config
+from parsers.csv_parser import parse_expense_sheet, parse_payment_log
+from parsers.pdf_parser import parse_invoice_directory, parse_invoice_pdf
+from reconciler.ledger import Reconciler, save_ledger
+from utils.logger import get_logger
+from utils.models import ExpenseEntry, Invoice, LedgerEntry, PaymentRecord
+
+logger = get_logger("agents.finance_agent")
+
+_BANNER = """
+╔══════════════════════════════════════════════════════════╗
+║            F I N A N C E  A I   A G E N T               ║
+║    Automated Invoice Reconciliation  ·  Extremely Precise║
+╚══════════════════════════════════════════════════════════╝
+""".strip()
+
+
+class FinanceAgent:
+    """
+    High-level orchestrator.
+
+    Usage:
+        agent = FinanceAgent()
+        agent.load_invoices(invoice_dir=Path("data/invoices"))
+        agent.load_payments(csv_path=Path("data/payments.csv"))
+        agent.load_expenses(csv_path=Path("data/expenses.csv"))
+        ledger = agent.run()
+    """
+
+    def __init__(self) -> None:
+        self.invoices:  List[Invoice]       = []
+        self.payments:  List[PaymentRecord] = []
+        self.expenses:  List[ExpenseEntry]  = []
+        self._ledger:   List[LedgerEntry]   = []
+        logger.info(_BANNER)
+
+    # ── Data loaders ──────────────────────────────────────────────────────────
+
+    def load_invoices(
+        self,
+        invoice_dir: Optional[Path] = None,
+        pdf_files:   Optional[List[Path]] = None,
+    ) -> "FinanceAgent":
+        """Load invoices from a directory of PDFs, a list of PDF paths, or both."""
+        if invoice_dir:
+            self.invoices += parse_invoice_directory(Path(invoice_dir))
+
+        for pdf in (pdf_files or []):
+            try:
+                self.invoices.append(parse_invoice_pdf(Path(pdf)))
+            except Exception as exc:
+                logger.error("Failed to load %s: %s", pdf, exc)
+
+        logger.info("Total invoices loaded: %d", len(self.invoices))
+        return self
+
+    def load_payments(self, csv_path: Path) -> "FinanceAgent":
+        """Load a payment-log CSV."""
+        self.payments += parse_payment_log(Path(csv_path))
+        logger.info("Total payment records loaded: %d", len(self.payments))
+        return self
+
+    def load_expenses(self, csv_path: Path) -> "FinanceAgent":
+        """Load an expense spreadsheet (CSV or XLSX)."""
+        self.expenses += parse_expense_sheet(Path(csv_path))
+        logger.info("Total expense entries loaded: %d", len(self.expenses))
+        return self
+
+    # ── Pipeline ──────────────────────────────────────────────────────────────
+
+    def run(
+        self,
+        output_path: Optional[Path] = None,
+    ) -> List[LedgerEntry]:
+        """
+        Execute the full reconciliation pipeline:
+          1. Validate invoices
+          2. Detect duplicates
+          3. Match payments
+          4. Generate ledger
+          5. Write JSON output
+        """
+        if not self.invoices and not self.payments:
+            logger.warning("No invoices or payments loaded — nothing to reconcile.")
+            return []
+
+        reconciler  = Reconciler(self.invoices, self.payments, self.expenses)
+        self._ledger = reconciler.reconcile()
+
+        out = Path(output_path) if output_path else config.LEDGER_OUTPUT_FILE
+        save_ledger(self._ledger, out)
+
+        self._print_summary()
+        return self._ledger
+
+    # ── Reporting helpers ─────────────────────────────────────────────────────
+
+    def _print_summary(self) -> None:
+        if not self._ledger:
+            return
+
+        from utils.models import FlagReason, PaymentStatus
+        total   = len(self._ledger)
+        flagged = sum(1 for e in self._ledger if FlagReason.NONE not in e.flags)
+        paid    = sum(1 for e in self._ledger if e.payment_status == PaymentStatus.PAID)
+        unpaid  = sum(1 for e in self._ledger if e.payment_status == PaymentStatus.UNPAID)
+
+        logger.info("=" * 60)
+        logger.info("RECONCILIATION SUMMARY")
+        logger.info("  Total entries   : %d", total)
+        logger.info("  Fully paid      : %d", paid)
+        logger.info("  Unpaid          : %d", unpaid)
+        logger.info("  Flagged         : %d", flagged)
+        logger.info("  Total invoiced  : $%.2f", sum(e.amount for e in self._ledger))
+        logger.info("  Total paid      : $%.2f", sum(e.amount_paid for e in self._ledger))
+        logger.info("=" * 60)
+
+    def get_flagged(self) -> List[LedgerEntry]:
+        """Return only entries that carry at least one non-NONE flag."""
+        from utils.models import FlagReason
+        return [e for e in self._ledger if FlagReason.NONE not in e.flags]
+
+    def to_json(self) -> str:
+        """Return the ledger as a pretty-printed JSON string."""
+        return json.dumps(
+            [e.to_dict() for e in self._ledger],
+            indent=2,
+            default=str,
+        )
+              """
+FinanceAI — PDF Parser
+Extracts raw text from PDFs then calls Claude to structure it into an Invoice.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from datetime import date
+from pathlib import Path
+from typing import List, Optional
+
+import anthropic
+
+# ── local imports ─────────────────────────────────────────────────────────────
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import config
+from utils.logger import get_logger
+from utils.models import Invoice, LineItem
+
+logger = get_logger("parsers.pdf_parser")
+
+# ── Try to import pdfplumber (graceful fallback to PyPDF2 / raw bytes) ────────
+try:
+    import pdfplumber
+    _PDF_BACKEND = "pdfplumber"
+except ImportError:
+    pdfplumber = None          # type: ignore
+    try:
+        import PyPDF2          # type: ignore
+        _PDF_BACKEND = "PyPDF2"
+    except ImportError:
+        PyPDF2 = None          # type: ignore
+        _PDF_BACKEND = "none"
+
+logger.debug("PDF backend: %s", _PDF_BACKEND)
+
+
+# ── Raw text extraction ───────────────────────────────────────────────────────
+
+def _extract_text_pdfplumber(path: Path) -> str:
+    pages = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            pages.append(text)
+    return "\n".join(pages)
+
+
+def _extract_text_pypdf2(path: Path) -> str:
+    pages = []
+    with open(path, "rb") as fh:
+        reader = PyPDF2.PdfReader(fh)
+        for page in reader.pages:
+            pages.append(page.extract_text() or "")
+    return "\n".join(pages)
+
+
+def extract_text(path: Path) -> str:
+    """Return the plain-text content of a PDF file."""
+    if _PDF_BACKEND == "pdfplumber":
+        return _extract_text_pdfplumber(path)
+    if _PDF_BACKEND == "PyPDF2":
+        return _extract_text_pypdf2(path)
+    raise RuntimeError(
+        "No PDF library found. Install pdfplumber: pip install pdfplumber"
+    )
+
+
+# ── Claude-powered structuring ────────────────────────────────────────────────
+
+_SYSTEM_PROMPT = """
+You are a meticulous financial data extraction engine.
+Given the raw text of an invoice, return ONLY a valid JSON object with this schema:
+
+{
+  "vendor":         "<string>",
+  "invoice_number": "<string>",
+  "invoice_date":   "<YYYY-MM-DD or null>",
+  "due_date":       "<YYYY-MM-DD or null>",
+  "currency":       "<3-letter ISO code, default USD>",
+  "line_items": [
+    {
+      "description": "<string>",
+      "quantity":    <number>,
+      "unit_price":  <number>,
+      "total":       <number>
+    }
+  ],
+  "subtotal": <number>,
+  "tax":      <number>,
+  "total":    <number>
+}
+
+Rules:
+- All amounts must be plain numbers (no currency symbols).
+- If a field cannot be determined set it to null (strings) or 0 (numbers).
+- Never add extra keys or prose outside the JSON.
+- Be extremely careful with totals; cross-check line items.
+""".strip()
+
+
+def _call_claude(raw_text: str) -> dict:
+    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    message = client.messages.create(
+        model      = config.CLAUDE_MODEL,
+        max_tokens = config.MAX_TOKENS,
+        system     = _SYSTEM_PROMPT,
+        messages   = [{"role": "user", "content": raw_text}],
+    )
+    content = message.content[0].text.strip()
+    # Strip markdown fences if present
+    content = re.sub(r"^```[a-z]*\n?", "", content)
+    content = re.sub(r"\n?```$", "", content)
+    return json.loads(content)
+
+
+def _parse_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _dict_to_invoice(data: dict, source_file: str, raw_text: str) -> Invoice:
+    line_items = [
+        LineItem(
+            description=li.get("description", ""),
+            quantity   =float(li.get("quantity", 1)),
+            unit_price =float(li.get("unit_price", 0)),
+            total      =float(li.get("total", 0)),
+        )
+        for li in data.get("line_items", [])
+    ]
+    return Invoice(
+        vendor         = data.get("vendor") or "UNKNOWN",
+        invoice_number = data.get("invoice_number") or "UNKNOWN",
+        invoice_date   = _parse_date(data.get("invoice_date")),
+        due_date       = _parse_date(data.get("due_date")),
+        line_items     = line_items,
+        subtotal       = float(data.get("subtotal") or 0),
+        tax            = float(data.get("tax") or 0),
+        total          = float(data.get("total") or 0),
+        currency       = data.get("currency") or "USD",
+        source_file    = source_file,
+        raw_text       = raw_text,
+    )
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def parse_invoice_pdf(path: Path) -> Invoice:
+    """
+    Parse a PDF invoice file and return a structured Invoice object.
+
+    Steps:
+      1. Extract plain text with the best available PDF library.
+      2. Send text to Claude for structured extraction.
+      3. Map the JSON response to our Invoice dataclass.
+    """
+    path = Path(path)
+    logger.info("Parsing PDF: %s", path.name)
+
+    raw_text = extract_text(path)
+    if not raw_text.strip():
+        raise ValueError(f"PDF {path.name} yielded no extractable text.")
+
+    logger.debug("Extracted %d chars from %s", len(raw_text), path.name)
+
+    try:
+        data = _call_claude(raw_text)
+    except json.JSONDecodeError as exc:
+        logger.error("Claude returned non-JSON for %s: %s", path.name, exc)
+        raise
+
+    invoice = _dict_to_invoice(data, source_file=str(path), raw_text=raw_text)
+    logger.info(
+        "  → vendor=%s  invoice#=%s  total=%.2f",
+        invoice.vendor, invoice.invoice_number, invoice.total,
+    )
+    return invoice
+
+
+def parse_invoice_directory(directory: Path) -> List[Invoice]:
+    """Parse every *.pdf in *directory* and return a list of Invoice objects."""
+    directory = Path(directory)
+    pdf_files = sorted(directory.glob("*.pdf"))
+    if not pdf_files:
+        logger.warning("No PDF files found in %s", directory)
+        return []
+
+    invoices = []
+    for pdf in pdf_files:
+        try:
+            invoices.append(parse_invoice_pdf(pdf))
+        except Exception as exc:
+            logger.error("Failed to parse %s: %s", pdf.name, exc)
+    return invoices
+    """
+FinanceAI — CSV / Spreadsheet Parser
+Reads payment-log CSVs and expense spreadsheets into typed dataclasses.
+
+Expected payment-log columns (case-insensitive, flexible header matching):
+  vendor | invoice_number | payment_date | amount_paid | payment_method | reference
+
+Expected expense-sheet columns:
+  vendor | description | amount | category | date | approved_by
+"""
+
+from __future__ import annotations
+
+import csv
+import sys
+from datetime import date
+from pathlib import Path
+from typing import Dict, List, Optional
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils.logger import get_logger
+from utils.models import ExpenseEntry, PaymentRecord
+
+logger = get_logger("parsers.csv_parser")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _parse_date(value: str) -> Optional[date]:
+    """Try several common date formats; return None on failure."""
+    value = value.strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return date.strptime(value, fmt) if hasattr(date, "strptime") else \
+                   __import__("datetime").datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+    logger.warning("Could not parse date: %r", value)
+    return None
+
+
+def _safe_float(value: str) -> float:
+    """Strip currency symbols / commas and convert to float."""
+    cleaned = value.strip().replace(",", "").lstrip("$£€¥")
+    try:
+        return float(cleaned)
+    except ValueError:
+        logger.warning("Could not convert amount: %r → 0.0", value)
+        return 0.0
+
+
+def _normalise_headers(headers: List[str]) -> Dict[str, int]:
+    """Return {canonical_name: column_index} mapping, case-insensitive."""
+    _aliases = {
+        "vendor":          ["vendor", "supplier", "company", "payee"],
+        "invoice_number":  ["invoice_number", "invoice_no", "invoice#", "inv_no", "inv#"],
+        "payment_date":    ["payment_date", "date_paid", "pay_date", "date"],
+        "amount_paid":     ["amount_paid", "amount", "paid", "payment_amount", "pay_amount"],
+        "payment_method":  ["payment_method", "method", "pay_method", "mode"],
+        "reference":       ["reference", "ref", "transaction_id", "txn_id"],
+        "description":     ["description", "desc", "item", "details"],
+        "category":        ["category", "cat", "expense_type", "type"],
+        "approved_by":     ["approved_by", "approver", "authorised_by", "authorized_by"],
+    }
+    lower_headers = [h.lower().strip() for h in headers]
+    result: Dict[str, int] = {}
+    for canonical, aliases in _aliases.items():
+        for alias in aliases:
+            if alias in lower_headers:
+                result[canonical] = lower_headers.index(alias)
+                break
+    return result
+
+
+# ── Payment log parser ────────────────────────────────────────────────────────
+
+def parse_payment_log(path: Path) -> List[PaymentRecord]:
+    """
+    Parse a CSV payment log.
+    Returns a list of PaymentRecord objects.
+    """
+    path = Path(path)
+    logger.info("Parsing payment log: %s", path.name)
+    records: List[PaymentRecord] = []
+
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.reader(fh)
+        raw_headers = next(reader, None)
+        if raw_headers is None:
+            logger.warning("%s is empty.", path.name)
+            return records
+
+        col = _normalise_headers(raw_headers)
+        required = {"vendor", "invoice_number", "amount_paid"}
+        missing  = required - col.keys()
+        if missing:
+            logger.error("Payment log missing required columns: %s", missing)
+            return records
+
+        for i, row in enumerate(reader, start=2):
+            if not any(row):           # skip blank lines
+                continue
+            try:
+                record = PaymentRecord(
+                    vendor         = row[col["vendor"]].strip(),
+                    invoice_number = row[col["invoice_number"]].strip(),
+                    payment_date   = _parse_date(row[col["payment_date"]]) if "payment_date" in col else None,
+                    amount_paid    = _safe_float(row[col["amount_paid"]]),
+                    payment_method = row[col["payment_method"]].strip() if "payment_method" in col else "",
+                    reference      = row[col["reference"]].strip()       if "reference"      in col else "",
+                )
+                records.append(record)
+            except IndexError as exc:
+                logger.warning("Row %d malformed in %s: %s", i, path.name, exc)
+
+    logger.info("  → %d payment records loaded from %s", len(records), path.name)
+    return records
+
+
+# ── Expense spreadsheet parser ────────────────────────────────────────────────
+
+def parse_expense_sheet(path: Path) -> List[ExpenseEntry]:
+    """
+    Parse a CSV expense spreadsheet.
+    Returns a list of ExpenseEntry objects.
+    """
+    path = Path(path)
+    logger.info("Parsing expense sheet: %s", path.name)
+    entries: List[ExpenseEntry] = []
+
+    # Support .xlsx via openpyxl if available
+    if path.suffix.lower() in (".xlsx", ".xls"):
+        try:
+            import openpyxl                          # type: ignore
+            wb = openpyxl.load_workbook(path, data_only=True)
+            ws = wb.active
+            rows = [
+                [str(cell.value) if cell.value is not None else "" for cell in row]
+                for row in ws.iter_rows()
+            ]
+        except ImportError:
+            logger.error("openpyxl not installed. pip install openpyxl")
+            return entries
+    else:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            rows = list(csv.reader(fh))
+
+    if not rows:
+        return entries
+
+    col = _normalise_headers(rows[0])
+    required = {"vendor", "amount_paid"}
+    missing  = required - col.keys()
+    if missing:
+        logger.error("Expense sheet missing required columns: %s", missing)
+        return entries
+
+    for i, row in enumerate(rows[1:], start=2):
+        if not any(row):
+            continue
+        try:
+            entry = ExpenseEntry(
+                vendor      = row[col["vendor"]].strip(),
+                description = row[col["description"]].strip() if "description" in col else "",
+                amount      = _safe_float(row[col["amount_paid"]]),
+                category    = row[col["category"]].strip()    if "category"    in col else "",
+                entry_date  = _parse_date(row[col["payment_date"]]) if "payment_date" in col else None,
+                approved_by = row[col["approved_by"]].strip() if "approved_by" in col else "",
+            )
+            entries.append(entry)
+        except IndexError as exc:
+            logger.warning("Row %d malformed in %s: %s", i, path.name, exc)
+
+    logger.info("  → %d expense entries loaded from %s", len(entries), path.name)
+    return entries
+    """
+FinanceAI — Invoice Validator
+Extremely skeptical total-verification and field-integrity checks.
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+from pathlib import Path
+from typing import List, Tuple
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import config
+from utils.logger import get_logger
+from utils.models import FlagReason, Invoice
+
+logger = get_logger("validators.invoice_validator")
+
+
+def _close_enough(a: float, b: float, tol: float = config.AMOUNT_TOLERANCE) -> bool:
+    """True if |a – b| ≤ tol."""
+    return math.isclose(a, b, abs_tol=tol, rel_tol=0)
+
+
+# ── Individual checks ─────────────────────────────────────────────────────────
+
+def check_required_fields(invoice: Invoice) -> List[Tuple[FlagReason, str]]:
+    issues: List[Tuple[FlagReason, str]] = []
+    if invoice.vendor.upper() in ("UNKNOWN", ""):
+        issues.append((FlagReason.MISSING_FIELD, "Vendor name is missing."))
+    if invoice.invoice_number.upper() in ("UNKNOWN", ""):
+        issues.append((FlagReason.MISSING_FIELD, "Invoice number is missing."))
+    if invoice.invoice_date is None:
+        issues.append((FlagReason.MISSING_FIELD, "Invoice date is missing."))
+    if invoice.total <= 0:
+        issues.append((FlagReason.MISSING_FIELD, "Invoice total is zero or negative."))
+    return issues
+
+
+def check_line_item_totals(invoice: Invoice) -> List[Tuple[FlagReason, str]]:
+    """Verify each line-item total = quantity × unit_price, and subtotal sums correctly."""
+    issues: List[Tuple[FlagReason, str]] = []
+
+    for idx, li in enumerate(invoice.line_items):
+        expected = round(li.quantity * li.unit_price, 2)
+        if not _close_enough(li.total, expected):
+            issues.append((
+                FlagReason.TOTAL_MISMATCH,
+                f"Line item {idx+1} ({li.description!r}): "
+                f"stated total {li.total:.2f} ≠ qty×price {expected:.2f}.",
+            ))
+
+    line_sum = round(sum(li.total for li in invoice.line_items), 2)
+    if invoice.line_items and not _close_enough(invoice.subtotal, line_sum):
+        issues.append((
+            FlagReason.TOTAL_MISMATCH,
+            f"Subtotal {invoice.subtotal:.2f} ≠ sum of line items {line_sum:.2f}.",
+        ))
+
+    expected_total = round(invoice.subtotal + invoice.tax, 2)
+    if not _close_enough(invoice.total, expected_total):
+        issues.append((
+            FlagReason.TOTAL_MISMATCH,
+            f"Grand total {invoice.total:.2f} ≠ subtotal+tax "
+            f"({invoice.subtotal:.2f}+{invoice.tax:.2f}={expected_total:.2f}).",
+        ))
+
+    # Double-check using computed_total shortcut
+    if not _close_enough(invoice.total, invoice.computed_total):
+        issues.append((
+            FlagReason.TOTAL_MISMATCH,
+            f"Cross-check failed: stated total {invoice.total:.2f} ≠ "
+            f"computed total {invoice.computed_total:.2f}.",
+        ))
+
+    return issues
+
+
+def check_amount_thresholds(invoice: Invoice) -> List[Tuple[FlagReason, str]]:
+    issues: List[Tuple[FlagReason, str]] = []
+    if invoice.total < config.MIN_INVOICE_AMOUNT:
+        issues.append((
+            FlagReason.UNUSUALLY_SMALL,
+            f"Total {invoice.total:.2f} is below minimum threshold "
+            f"{config.MIN_INVOICE_AMOUNT:.2f}.",
+        ))
+    if invoice.total > config.MAX_INVOICE_AMOUNT:
+        issues.append((
+            FlagReason.UNUSUALLY_LARGE,
+            f"Total {invoice.total:.2f} exceeds high-value threshold "
+            f"{config.MAX_INVOICE_AMOUNT:,.2f}. Manual review required.",
+        ))
+    return issues
+
+
+def check_date_anomalies(invoice: Invoice) -> List[Tuple[FlagReason, str]]:
+    from datetime import date as _date
+    issues: List[Tuple[FlagReason, str]] = []
+    today = _date.today()
+
+    if invoice.invoice_date and invoice.invoice_date > today:
+        issues.append((
+            FlagReason.DATE_ANOMALY,
+            f"Invoice date {invoice.invoice_date} is in the future.",
+        ))
+    if invoice.due_date and invoice.invoice_date and \
+            invoice.due_date < invoice.invoice_date:
+        issues.append((
+            FlagReason.DATE_ANOMALY,
+            f"Due date {invoice.due_date} is before invoice date "
+            f"{invoice.invoice_date}.",
+        ))
+    return issues
+
+
+# ── Main entry-point ──────────────────────────────────────────────────────────
+
+def validate_invoice(invoice: Invoice) -> List[Tuple[FlagReason, str]]:
+    """
+    Run all validation checks against a single Invoice.
+    Returns a (possibly empty) list of (FlagReason, human-readable note) tuples.
+    """
+    logger.debug(
+        "Validating invoice %s / %s  total=%.2f",
+        invoice.vendor, invoice.invoice_number, invoice.total,
+    )
+    issues: List[Tuple[FlagReason, str]] = []
+
+    issues += check_required_fields(invoice)
+    issues += check_line_item_totals(invoice)
+    issues += check_amount_thresholds(invoice)
+    issues += check_date_anomalies(invoice)
+
+    if issues:
+        logger.warning(
+            "Invoice %s has %d issue(s):", invoice.invoice_number, len(issues)
+        )
+        for reason, note in issues:
+            logger.warning("  [%s] %s", reason.value, note)
+    else:
+        logger.info("Invoice %s passed all validation checks.", invoice.invoice_number)
+
+    return issues
+              """
+FinanceAI — Duplicate Detector
+Identifies probable duplicate invoices using multiple heuristics.
+
+Detection strategy (in priority order):
+  1. Exact invoice number match (same vendor).
+  2. Same vendor + same amount within DUPLICATE_WINDOW_DAYS days.
+  3. Fuzzy vendor name match + same amount + same date (catches typos).
+"""
+
+from __future__ import annotations
+
+import sys
+from collections import defaultdict
+from datetime import date, timedelta
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Dict, List, Set, Tuple
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import config
+from utils.logger import get_logger
+from utils.models import Invoice
+
+logger = get_logger("validators.duplicate_detector")
+
+_FUZZY_VENDOR_THRESHOLD = 0.85   # SequenceMatcher ratio; 1.0 = identical
+
+
+def _vendor_similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+
+
+def _same_amount(a: float, b: float) -> bool:
+    return abs(a - b) <= config.AMOUNT_TOLERANCE
+
+
+def _within_window(d1: date | None, d2: date | None) -> bool:
+    if d1 is None or d2 is None:
+        return True          # unknown dates → conservatively flag
+    return abs((d1 - d2).days) <= config.DUPLICATE_WINDOW_DAYS
+
+
+# ── Core logic ────────────────────────────────────────────────────────────────
+
+class DuplicateDetector:
+    """
+    Stateful detector: ingest invoices one at a time; call report() when done.
+    """
+
+    def __init__(self) -> None:
+        self._invoices: List[Invoice] = []
+
+    def add(self, invoice: Invoice) -> None:
+        self._invoices.append(invoice)
+
+    # ── strategies ────────────────────────────────────────────────────────────
+
+    def _find_exact_number_dupes(self) -> Set[Tuple[str, str]]:
+        """
+        Return pairs of UIDs that share (vendor, invoice_number).
+        Case-insensitive, stripped whitespace.
+        """
+        seen: Dict[Tuple[str, str], str] = {}   # key → first UID
+        dupes: Set[Tuple[str, str]] = set()
+
+        for inv in self._invoices:
+            key = (inv.vendor.lower().strip(), inv.invoice_number.lower().strip())
+            if key in seen:
+                pair = tuple(sorted([seen[key], inv.uid]))  # type: ignore[arg-type]
+                dupes.add(pair)  # type: ignore[arg-type]
+                logger.warning(
+                    "Exact duplicate: vendor=%r inv#=%r  UIDs %s vs %s",
+                    inv.vendor, inv.invoice_number, seen[key], inv.uid,
+                )
+            else:
+                seen[key] = inv.uid
+
+        return dupes
+
+    def _find_amount_window_dupes(self) -> Set[Tuple[str, str]]:
+        """Same vendor + same amount within date window."""
+        dupes: Set[Tuple[str, str]] = set()
+
+        for i, a in enumerate(self._invoices):
+            for b in self._invoices[i + 1:]:
+                if a.vendor.lower().strip() != b.vendor.lower().strip():
+                    continue
+                if not _same_amount(a.total, b.total):
+                    continue
+                if not _within_window(a.invoice_date, b.invoice_date):
+                    continue
+                pair = tuple(sorted([a.uid, b.uid]))      # type: ignore[arg-type]
+                dupes.add(pair)                           # type: ignore[arg-type]
+                logger.warning(
+                    "Amount-window duplicate: vendor=%r  amount=%.2f  "
+                    "dates=%s/%s  UIDs %s vs %s",
+                    a.vendor, a.total, a.invoice_date, b.invoice_date,
+                    a.uid, b.uid,
+                )
+
+        return dupes
+
+    def _find_fuzzy_vendor_dupes(self) -> Set[Tuple[str, str]]:
+        """Fuzzy vendor name + same amount + same date (catches OCR/typos)."""
+        dupes: Set[Tuple[str, str]] = set()
+
+        for i, a in enumerate(self._invoices):
+            for b in self._invoices[i + 1:]:
+                if a.vendor.lower().strip() == b.vendor.lower().strip():
+                    continue       # already caught above
+                sim = _vendor_similarity(a.vendor, b.vendor)
+                if sim < _FUZZY_VENDOR_THRESHOLD:
+                    continue
+                if not _same_amount(a.total, b.total):
+                    continue
+                if a.invoice_date != b.invoice_date:
+                    continue
+                pair = tuple(sorted([a.uid, b.uid]))      # type: ignore[arg-type]
+                dupes.add(pair)                           # type: ignore[arg-type]
+                logger.warning(
+                    "Fuzzy-vendor duplicate: %r ≈ %r (sim=%.2f)  "
+                    "amount=%.2f  date=%s  UIDs %s vs %s",
+                    a.vendor, b.vendor, sim, a.total, a.invoice_date,
+                    a.uid, b.uid,
+                )
+
+        return dupes
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def find_duplicates(self) -> Dict[str, List[str]]:
+        """
+        Return {uid: [reason_string, ...]} for every invoice
+        identified as a duplicate.
+        """
+        logger.info("Running duplicate detection on %d invoices …", len(self._invoices))
+
+        exact  = self._find_exact_number_dupes()
+        window = self._find_amount_window_dupes()
+        fuzzy  = self._find_fuzzy_vendor_dupes()
+
+        # Build per-uid map
+        uid_to_reasons: Dict[str, List[str]] = defaultdict(list)
+
+        for uid_a, uid_b in exact:
+            msg = f"Exact duplicate of invoice sharing same number/vendor (paired with {uid_b[:8]}…)"
+            uid_to_reasons[uid_a].append(msg)
+            uid_to_reasons[uid_b].append(
+                f"Exact duplicate of invoice sharing same number/vendor (paired with {uid_a[:8]}…)"
+            )
+
+        for uid_a, uid_b in window - exact:
+            msg = f"Same vendor+amount within {config.DUPLICATE_WINDOW_DAYS}d window (paired with {uid_b[:8]}…)"
+            uid_to_reasons[uid_a].append(msg)
+            uid_to_reasons[uid_b].append(
+                f"Same vendor+amount within {config.DUPLICATE_WINDOW_DAYS}d window (paired with {uid_a[:8]}…)"
+            )
+
+        for uid_a, uid_b in fuzzy - exact - window:
+            msg = f"Fuzzy-vendor + same amount/date (paired with {uid_b[:8]}…)"
+            uid_to_reasons[uid_a].append(msg)
+            uid_to_reasons[uid_b].append(
+                f"Fuzzy-vendor + same amount/date (paired with {uid_a[:8]}…)"
+            )
+
+        total_flagged = len(uid_to_reasons)
+        if total_flagged:
+            logger.warning("%d invoice(s) flagged as potential duplicates.", total_flagged)
+        else:
+            logger.info("No duplicate invoices detected.")
+
+        return dict(uid_to_reasons)
+
+
+def detect_duplicates(invoices: List[Invoice]) -> Dict[str, List[str]]:
+    """Convenience wrapper: build a detector, add all invoices, return results."""
+    detector = DuplicateDetector()
+    for inv in invoices:
+        detector.add(inv)
+    return detector.find_duplicates()
+                  """
+FinanceAI — Reconciler & Ledger Generator
+Matches invoices to payment records; produces the final JSON ledger.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from datetime import date
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import config
+from utils.logger import get_logger
+from utils.models import (
+    ExpenseEntry,
+    FlagReason,
+    Invoice,
+    LedgerEntry,
+    PaymentRecord,
+    PaymentStatus,
+)
+from validators.duplicate_detector import detect_duplicates
+from validators.invoice_validator import validate_invoice
+
+logger = get_logger("reconciler.ledger")
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _fmt_date(d: Optional[date]) -> Optional[str]:
+    return d.isoformat() if d else None
+
+
+def _match_payment(
+    invoice: Invoice,
+    payments: List[PaymentRecord],
+) -> Tuple[float, PaymentStatus, List[Tuple[FlagReason, str]]]:
+    """
+    Locate payment records that match this invoice.
+
+    Matching strategy:
+      1. Same invoice_number (case-insensitive, stripped).
+      2. Fallback: same vendor + same amount (within tolerance).
+
+    Returns (amount_paid, status, extra_issues).
+    """
+    issues: List[Tuple[FlagReason, str]] = []
+
+    inv_num = invoice.invoice_number.lower().strip()
+    vendor  = invoice.vendor.lower().strip()
+
+    matched = [
+        p for p in payments
+        if p.invoice_number.lower().strip() == inv_num
+        and p.vendor.lower().strip() == vendor
+    ]
+
+    if not matched:
+        # Fuzzy fallback: vendor + amount only
+        matched = [
+            p for p in payments
+            if p.vendor.lower().strip() == vendor
+            and abs(p.amount_paid - invoice.total) <= config.AMOUNT_TOLERANCE
+        ]
+        if matched:
+            logger.debug(
+                "Invoice %s matched payment by vendor+amount (no inv# match).",
+                invoice.invoice_number,
+            )
+
+    if not matched:
+        issues.append((
+            FlagReason.PAYMENT_DISCREPANCY,
+            "No matching payment record found.",
+        ))
+        return 0.0, PaymentStatus.UNPAID, issues
+
+    total_paid = round(sum(p.amount_paid for p in matched), 2)
+
+    if abs(total_paid - invoice.total) <= config.AMOUNT_TOLERANCE:
+        status = PaymentStatus.PAID
+    elif total_paid > invoice.total + config.AMOUNT_TOLERANCE:
+        status = PaymentStatus.OVERPAID
+        issues.append((
+            FlagReason.PAYMENT_DISCREPANCY,
+            f"Overpaid by {total_paid - invoice.total:.2f} "
+            f"({total_paid:.2f} paid vs {invoice.total:.2f} invoiced).",
+        ))
+    elif total_paid > 0:
+        status = PaymentStatus.PARTIAL
+        issues.append((
+            FlagReason.PAYMENT_DISCREPANCY,
+            f"Partial payment: {total_paid:.2f} of {invoice.total:.2f} received "
+            f"(outstanding {invoice.total - total_paid:.2f}).",
+        ))
+    else:
+        status = PaymentStatus.UNPAID
+        issues.append((
+            FlagReason.PAYMENT_DISCREPANCY,
+            "Payment record found but amount_paid = 0.",
+        ))
+
+    return total_paid, status, issues
+
+
+def _check_unmatched_payments(
+    invoices: List[Invoice],
+    payments: List[PaymentRecord],
+) -> List[LedgerEntry]:
+    """
+    Return phantom ledger entries for payments that don't correspond to any
+    known invoice (possible fraud / data-entry error).
+    """
+    invoice_numbers = {
+        inv.invoice_number.lower().strip() for inv in invoices
+    }
+    orphans = [
+        p for p in payments
+        if p.invoice_number.lower().strip() not in invoice_numbers
+    ]
+
+    entries: List[LedgerEntry] = []
+    for orphan in orphans:
+        logger.warning(
+            "Unmatched payment: vendor=%r inv#=%r amount=%.2f — no invoice found.",
+            orphan.vendor, orphan.invoice_number, orphan.amount_paid,
+        )
+        import uuid
+        entries.append(
+            LedgerEntry(
+                vendor         = orphan.vendor,
+                invoice_number = orphan.invoice_number,
+                invoice_date   = _fmt_date(orphan.payment_date),
+                due_date       = None,
+                amount         = 0.0,
+                amount_paid    = orphan.amount_paid,
+                tax            = 0.0,
+                currency       = "USD",
+                payment_status = PaymentStatus.UNKNOWN,
+                flags          = [FlagReason.UNMATCHED_INVOICE],
+                flag_notes     = ["Payment exists with no corresponding invoice."],
+                source_file    = "",
+                uid            = str(uuid.uuid4()),
+            )
+        )
+    return entries
+
+
+# ── Main reconciler ───────────────────────────────────────────────────────────
+
+class Reconciler:
+    def __init__(
+        self,
+        invoices:  List[Invoice],
+        payments:  List[PaymentRecord],
+        expenses:  List[ExpenseEntry],
+    ) -> None:
+        self.invoices = invoices
+        self.payments = payments
+        self.expenses = expenses
+
+    def reconcile(self) -> List[LedgerEntry]:
+        logger.info(
+            "Starting reconciliation: %d invoices, %d payments, %d expenses.",
+            len(self.invoices), len(self.payments), len(self.expenses),
+        )
+
+        # ── Step 1: detect duplicates ─────────────────────────────────────────
+        dup_map = detect_duplicates(self.invoices)   # uid → [reason, ...]
+
+        # ── Step 2: validate each invoice & reconcile with payments ───────────
+        ledger: List[LedgerEntry] = []
+
+        for inv in self.invoices:
+            all_flags:  List[FlagReason] = []
+            all_notes:  List[str]        = []
+
+            # Validation
+            for reason, note in validate_invoice(inv):
+                all_flags.append(reason)
+                all_notes.append(note)
+
+            # Duplicate check
+            if inv.uid in dup_map:
+                all_flags.append(FlagReason.DUPLICATE)
+                all_notes.extend(dup_map[inv.uid])
+
+            # Payment matching
+            amount_paid, status, pay_issues = _match_payment(inv, self.payments)
+            for reason, note in pay_issues:
+                all_flags.append(reason)
+                all_notes.append(note)
+
+            if not all_flags:
+                all_flags = [FlagReason.NONE]
+
+            entry = LedgerEntry(
+                vendor         = inv.vendor,
+                invoice_number = inv.invoice_number,
+                invoice_date   = _fmt_date(inv.invoice_date),
+                due_date       = _fmt_date(inv.due_date),
+                amount         = inv.total,
+                amount_paid    = amount_paid,
+                tax            = inv.tax,
+                currency       = inv.currency,
+                payment_status = status,
+                flags          = list(dict.fromkeys(all_flags)),   # deduplicate, preserve order
+                flag_notes     = all_notes,
+                source_file    = inv.source_file,
+                uid            = inv.uid,
+            )
+            ledger.append(entry)
+            logger.info(
+                "Reconciled %-30s  status=%-10s  flags=%s",
+                f"{inv.vendor}/{inv.invoice_number}",
+                status.value,
+                [f.value for f in entry.flags],
+            )
+
+        # ── Step 3: orphan payments (no invoice) ──────────────────────────────
+        orphans = _check_unmatched_payments(self.invoices, self.payments)
+        ledger.extend(orphans)
+
+        logger.info(
+            "Reconciliation complete: %d ledger entries (%d clean, %d flagged, %d orphan payments).",
+            len(ledger),
+            sum(1 for e in ledger if e.flags == [FlagReason.NONE]),
+            sum(1 for e in ledger if e.flags != [FlagReason.NONE]),
+            len(orphans),
+        )
+        return ledger
+
+
+# ── JSON output ───────────────────────────────────────────────────────────────
+
+def save_ledger(ledger: List[LedgerEntry], output_path: Path) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    summary = {
+        "total_invoices":   len(ledger),
+        "total_amount":     round(sum(e.amount for e in ledger), 2),
+        "total_paid":       round(sum(e.amount_paid for e in ledger), 2),
+        "outstanding":      round(
+                                sum(e.amount - e.amount_paid for e in ledger
+                                    if e.payment_status != PaymentStatus.UNKNOWN),
+                                2,
+                            ),
+        "flagged_count":    sum(1 for e in ledger if FlagReason.NONE not in e.flags),
+        "status_breakdown": {
+            status.value: sum(1 for e in ledger if e.payment_status == status)
+            for status in PaymentStatus
+        },
+    }
+
+    payload = {
+        "summary": summary,
+        "ledger":  [e.to_dict() for e in ledger],
+    }
+
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=str)
+
+    logger.info("Ledger written to %s  (%d entries).", output_path, len(ledger))
+      """
+FinanceAI — Data Models
+Canonical dataclasses shared across every module.
+"""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from datetime import date
+from enum import Enum
+from typing import List, Optional
+
+
+# ── Enumerations ──────────────────────────────────────────────────────────────
+
+class PaymentStatus(str, Enum):
+    PAID       = "PAID"
+    UNPAID     = "UNPAID"
+    PARTIAL    = "PARTIAL"
+    UNKNOWN    = "UNKNOWN"
+    OVERPAID   = "OVERPAID"
+
+
+class FlagReason(str, Enum):
+    NONE                = "NONE"
+    DUPLICATE           = "DUPLICATE"
+    TOTAL_MISMATCH      = "TOTAL_MISMATCH"
+    MISSING_FIELD       = "MISSING_FIELD"
+    UNUSUALLY_LARGE     = "UNUSUALLY_LARGE"
+    UNUSUALLY_SMALL     = "UNUSUALLY_SMALL"
+    DATE_ANOMALY        = "DATE_ANOMALY"
+    PAYMENT_DISCREPANCY = "PAYMENT_DISCREPANCY"
+    UNMATCHED_INVOICE   = "UNMATCHED_INVOICE"
+
+
+# ── Core models ───────────────────────────────────────────────────────────────
+
+@dataclass
+class LineItem:
+    description: str
+    quantity:    float
+    unit_price:  float
+    total:       float
+
+
+@dataclass
+class Invoice:
+    """Parsed representation of a single invoice (PDF or text)."""
+    vendor:         str
+    invoice_number: str
+    invoice_date:   Optional[date]
+    due_date:       Optional[date]
+    line_items:     List[LineItem]
+    subtotal:       float
+    tax:            float
+    total:          float
+    currency:       str       = "USD"
+    source_file:    str       = ""
+    raw_text:       str       = ""
+    uid:            str       = field(default_factory=lambda: str(uuid.uuid4()))
+
+    @property
+    def computed_total(self) -> float:
+        return round(sum(li.total for li in self.line_items) + self.tax, 2)
+
+
+@dataclass
+class PaymentRecord:
+    """One row from the payment log CSV."""
+    vendor:         str
+    invoice_number: str
+    payment_date:   Optional[date]
+    amount_paid:    float
+    payment_method: str
+    reference:      str       = ""
+
+
+@dataclass
+class ExpenseEntry:
+    """One row from the expense spreadsheet."""
+    vendor:      str
+    description: str
+    amount:      float
+    category:    str
+    entry_date:  Optional[date]
+    approved_by: str = ""
+
+
+@dataclass
+class LedgerEntry:
+    """Final reconciled record written to the JSON ledger."""
+    vendor:         str
+    invoice_number: str
+    invoice_date:   Optional[str]        # ISO-8601 string or None
+    due_date:       Optional[str]
+    amount:         float
+    amount_paid:    float
+    tax:            float
+    currency:       str
+    payment_status: PaymentStatus
+    flags:          List[FlagReason]
+    flag_notes:     List[str]
+    source_file:    str
+    uid:            str
+
+    def to_dict(self) -> dict:
+        return {
+            "vendor":          self.vendor,
+            "invoice_number":  self.invoice_number,
+            "invoice_date":    self.invoice_date,
+            "due_date":        self.due_date,
+            "amount":          self.amount,
+            "amount_paid":     self.amount_paid,
+            "tax":             self.tax,
+            "currency":        self.currency,
+            "payment_status":  self.payment_status.value,
+            "flags":           [f.value for f in self.flags],
+            "flag_notes":      self.flag_notes,
+            "source_file":     self.source_file,
+            "uid":             self.uid,
+        }
+      """
+FinanceAI — Logging Utility
+Structured, coloured console + rotating file logger.
+"""
+
+import logging
+import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+import config
+
+# ANSI colour codes
+_COLOURS = {
+    "DEBUG":    "\033[36m",   # cyan
+    "INFO":     "\033[32m",   # green
+    "WARNING":  "\033[33m",   # yellow
+    "ERROR":    "\033[31m",   # red
+    "CRITICAL": "\033[35m",   # magenta
+    "RESET":    "\033[0m",
+}
+
+
+class ColouredFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        colour = _COLOURS.get(record.levelname, "")
+        reset  = _COLOURS["RESET"]
+        record.levelname = f"{colour}{record.levelname:<8}{reset}"
+        return super().format(record)
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Return a fully configured logger for *name*."""
+    logger = logging.getLogger(name)
+    if logger.handlers:          # avoid double-registering
+        return logger
+
+    level = getattr(logging, config.LOG_LEVEL.upper(), logging.DEBUG)
+    logger.setLevel(level)
+
+    # ── Console handler (coloured) ────────────────────────────────────────────
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(level)
+    ch.setFormatter(
+        ColouredFormatter(
+            fmt="%(asctime)s | %(levelname)s | %(name)-25s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(ch)
+
+    # ── Rotating file handler (plain) ─────────────────────────────────────────
+    fh = RotatingFileHandler(
+        config.LOG_FILE,
+        maxBytes=5 * 1024 * 1024,   # 5 MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    fh.setLevel(level)
+    fh.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s | %(levelname)-8s | %(name)-25s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(fh)
+
+    return logger
+          """
+FinanceAI — Sample Data Generator
+Creates realistic test fixtures (CSVs + mock invoice text) for CI / demo runs.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+import config
+
+PAYMENT_CSV = config.DATA_DIR / "sample_payments.csv"
+EXPENSE_CSV = config.DATA_DIR / "sample_expenses.csv"
+
+# ── Payment log ───────────────────────────────────────────────────────────────
+PAYMENTS = [
+    ["vendor",             "invoice_number", "payment_date", "amount_paid", "payment_method", "reference"],
+    ["Acme Corp",          "INV-2024-001",   "2024-01-15",   "1250.00",     "ACH",            "ACH-88712"],
+    ["Beta Supplies Ltd",  "INV-2024-002",   "2024-01-18",   "3400.00",     "Wire",           "WIRE-00341"],
+    ["Gamma Services",     "INV-2024-003",   "2024-01-20",   "580.00",      "Check",          "CHK-4421"],
+    ["Delta Tech",         "INV-2024-005",   "2024-01-25",   "999.00",      "ACH",            "ACH-89100"],
+    # Partial payment
+    ["Epsilon Media",      "INV-2024-006",   "2024-01-28",   "500.00",      "ACH",            "ACH-89200"],
+    # Orphan payment (no invoice)
+    ["Zeta Cloud",         "INV-2024-099",   "2024-01-30",   "120.00",      "Card",           "CARD-555"],
+    # Duplicate payment for Acme Corp
+    ["Acme Corp",          "INV-2024-001",   "2024-01-16",   "1250.00",     "ACH",            "ACH-88713"],
+]
+
+# ── Expense sheet ─────────────────────────────────────────────────────────────
+EXPENSES = [
+    ["vendor",             "description",          "amount",  "category",    "date",       "approved_by"],
+    ["Acme Corp",          "Office Supplies Q1",   "1250.00", "Office",      "2024-01-10", "J. Smith"],
+    ["Beta Supplies Ltd",  "Server Hardware",      "3400.00", "IT",          "2024-01-12", "T. Jones"],
+    ["Gamma Services",     "Consulting hours",     "580.00",  "Consulting",  "2024-01-15", "J. Smith"],
+    ["Delta Tech",         "Software licence",     "999.00",  "Software",    "2024-01-20", "T. Jones"],
+    ["Epsilon Media",      "Marketing campaign",   "1000.00", "Marketing",   "2024-01-25", "L. Green"],
+]
+
+# ── Mock invoice data (used by demo.py since we can't ship real PDFs) ─────────
+# These dicts simulate what the PDF parser + Claude would return.
+MOCK_INVOICES = [
+    {
+        "uid":            "mock-001",
+        "vendor":         "Acme Corp",
+        "invoice_number": "INV-2024-001",
+        "invoice_date":   "2024-01-10",
+        "due_date":       "2024-02-10",
+        "currency":       "USD",
+        "subtotal":       1136.36,
+        "tax":            113.64,
+        "total":          1250.00,
+        "source_file":    "acme_inv2024001.pdf",
+        "line_items": [
+            {"description": "A4 Paper (case)", "quantity": 10, "unit_price": 45.00,  "total": 450.00},
+            {"description": "Pens box",         "quantity":  5, "unit_price": 12.00,  "total":  60.00},
+            {"description": "Desk organisers",  "quantity":  4, "unit_price": 156.59, "total": 626.36},
+        ],
+    },
+    {
+        "uid":            "mock-002",
+        "vendor":         "Beta Supplies Ltd",
+        "invoice_number": "INV-2024-002",
+        "invoice_date":   "2024-01-12",
+        "due_date":       "2024-02-12",
+        "currency":       "USD",
+        "subtotal":       3090.91,
+        "tax":            309.09,
+        "total":          3400.00,
+        "source_file":    "beta_inv2024002.pdf",
+        "line_items": [
+            {"description": "SSD 2TB",   "quantity": 3, "unit_price": 800.00,  "total": 2400.00},
+            {"description": "RAM 32GB",  "quantity": 2, "unit_price": 345.455, "total": 690.91},
+        ],
+    },
+    {
+        "uid":            "mock-003",
+        "vendor":         "Gamma Services",
+        "invoice_number": "INV-2024-003",
+        "invoice_date":   "2024-01-15",
+        "due_date":       "2024-02-15",
+        "currency":       "USD",
+        "subtotal":       580.00,
+        "tax":            0.00,
+        "total":          580.00,
+        "source_file":    "gamma_inv2024003.pdf",
+        "line_items": [
+            {"description": "Consulting 8h", "quantity": 8, "unit_price": 72.50, "total": 580.00},
+        ],
+    },
+    # Invoice with intentional total mismatch (validator should catch it)
+    {
+        "uid":            "mock-004",
+        "vendor":         "Theta Analytics",
+        "invoice_number": "INV-2024-004",
+        "invoice_date":   "2024-01-18",
+        "due_date":       "2024-02-18",
+        "currency":       "USD",
+        "subtotal":       200.00,
+        "tax":            20.00,
+        "total":          235.00,       # ← wrong!  should be 220.00
+        "source_file":    "theta_inv2024004.pdf",
+        "line_items": [
+            {"description": "Data report", "quantity": 1, "unit_price": 200.00, "total": 200.00},
+        ],
+    },
+    # Large invoice (threshold flag)
+    {
+        "uid":            "mock-005",
+        "vendor":         "Delta Tech",
+        "invoice_number": "INV-2024-005",
+        "invoice_date":   "2024-01-20",
+        "due_date":       "2024-02-20",
+        "currency":       "USD",
+        "subtotal":       909.09,
+        "tax":            89.91,
+        "total":          999.00,
+        "source_file":    "delta_inv2024005.pdf",
+        "line_items": [
+            {"description": "Enterprise licence", "quantity": 1, "unit_price": 909.09, "total": 909.09},
+        ],
+    },
+    # Partial payment invoice
+    {
+        "uid":            "mock-006",
+        "vendor":         "Epsilon Media",
+        "invoice_number": "INV-2024-006",
+        "invoice_date":   "2024-01-25",
+        "due_date":       "2024-02-25",
+        "currency":       "USD",
+        "subtotal":       909.09,
+        "tax":            90.91,
+        "total":          1000.00,
+        "source_file":    "epsilon_inv2024006.pdf",
+        "line_items": [
+            {"description": "Campaign management", "quantity": 1, "unit_price": 909.09, "total": 909.09},
+        ],
+    },
+    # Duplicate of mock-001 (same vendor + amount, different inv#)
+    {
+        "uid":            "mock-007",
+        "vendor":         "Acme Corp",
+        "invoice_number": "INV-2024-001-R",   # re-submitted
+        "invoice_date":   "2024-01-11",
+        "due_date":       "2024-02-11",
+        "currency":       "USD",
+        "subtotal":       1136.36,
+        "tax":            113.64,
+        "total":          1250.00,
+        "source_file":    "acme_inv2024001_resubmit.pdf",
+        "line_items": [
+            {"description": "Office Supplies", "quantity": 1, "unit_price": 1136.36, "total": 1136.36},
+        ],
+    },
+]
+
+
+def generate_sample_data() -> None:
+    # Payment CSV
+    with open(PAYMENT_CSV, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerows(PAYMENTS)
+    print(f"[sample_data] Written: {PAYMENT_CSV}")
+
+    # Expense CSV
+    with open(EXPENSE_CSV, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerows(EXPENSES)
+    print(f"[sample_data] Written: {EXPENSE_CSV}")
+
+    # Mock invoices JSON (used by demo.py)
+    mock_path = config.DATA_DIR / "mock_invoices.json"
+    with open(mock_path, "w", encoding="utf-8") as fh:
+        json.dump(MOCK_INVOICES, fh, indent=2)
+    print(f"[sample_data] Written: {mock_path}")
+
+
+if __name__ == "__main__":
+    generate_sample_data()
+          
